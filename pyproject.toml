@@ -1,6 +1,6 @@
 [project]
 name = "byteforge-converse-core"
-version = "0.1.0"
+version = "0.2.0"
 authors = [
   { name="Jason Byteforge", email="jason@reallybadapps.com" },
 ]
@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     "psycopg2-binary",
     "byteforge-converse-models @ git+https://github.com/jmazzahacks/byteforge-converse-models.git",
+    "openrouter-client-unofficial @ git+https://github.com/jmazzahacks/openrouter-python-client.git",
 ]
 
 [build-system]

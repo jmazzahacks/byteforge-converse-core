@@ -2,8 +2,9 @@
 Business logic and service layer for ByteforgeConverse — LLM orchestration, conversation state, persistence.
 """
 
-from .config import DatabaseConfig
+from .config import DatabaseConfig, LLMConfig, DEFAULT_LLM_MODEL
 from .database import Database
+from .chat import ChatService
 
-__all__ = ["Database", "DatabaseConfig"]
-__version__ = "0.1.0"
+__all__ = ["Database", "DatabaseConfig", "LLMConfig", "DEFAULT_LLM_MODEL", "ChatService"]
+__version__ = "0.2.0"

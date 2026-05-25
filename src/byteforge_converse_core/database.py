@@ -12,9 +12,15 @@ from contextlib import contextmanager
 from typing import Iterator, Optional
 
 from psycopg2.pool import ThreadedConnectionPool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 
-from byteforge_converse_models import Conversation, Message, Session, VALID_ROLES
+from byteforge_converse_models import (
+    Conversation,
+    ConversationCreate,
+    Message,
+    Session,
+    VALID_ROLES,
+)
 
 from .config import DatabaseConfig
 
@@ -60,14 +66,23 @@ class Database:
 
     # --- conversations -----------------------------------------------------
 
-    def create_conversation(self, user_id: str, title: str) -> Conversation:
+    def create_conversation(self, create: ConversationCreate) -> Conversation:
+        response_schema = Json(create.response_schema) if create.response_schema is not None else None
         with self._cursor(commit=True) as cursor:
             cursor.execute(
-                "INSERT INTO conversations (user_id, title) VALUES (%s, %s) RETURNING *",
-                (user_id, title),
+                "INSERT INTO conversations (user_id, title, model, system_prompt, response_schema) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING *",
+                (create.user_id, create.title, create.model, create.system_prompt, response_schema),
             )
             row = cursor.fetchone()
         return Conversation.from_dict(dict(row))
+
+    def touch_conversation(self, conversation_id: str, updated_at: int) -> None:
+        with self._cursor(commit=True) as cursor:
+            cursor.execute(
+                "UPDATE conversations SET updated_at = %s WHERE id = %s",
+                (updated_at, conversation_id),
+            )
 
     def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
         with self._cursor() as cursor:
