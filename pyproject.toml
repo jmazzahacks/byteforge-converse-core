@@ -1,0 +1,30 @@
+[project]
+name = "byteforge-converse-core"
+version = "0.0.1"
+authors = [
+  { name="Jason Byteforge", email="jason@reallybadapps.com" },
+]
+description = "Business logic and service layer for ByteforgeConverse — LLM orchestration, conversation state, persistence"
+keywords = ["byteforge", "converse", "llm", "conversation", "core"]
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "O'Saasy License"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "byteforge-converse-models @ git+https://github.com/jmazzahacks/byteforge-converse-models.git",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/byteforge_converse_core"]
+
+[project.urls]
+Homepage = "https://github.com/jmazzahacks/byteforge-converse-core"
+Issues = "https://github.com/jmazzahacks/byteforge-converse-core/issues"
