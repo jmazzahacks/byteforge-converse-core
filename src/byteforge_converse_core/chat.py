@@ -7,11 +7,16 @@ call the model, persist the assistant turn, and return it. State lives in the
 database, not in this service — each turn is stateless.
 """
 
+import json
 import time
 import logging
-from typing import Optional
+from typing import Any, Optional
 
-from openrouter_client import OpenRouterClient
+from openrouter_client import (
+    OpenRouterClient,
+    build_json_schema_response_format,
+    parse_schema_response,
+)
 
 from byteforge_converse_models import Conversation, Message
 
@@ -47,10 +52,17 @@ class ChatService:
         messages = self._build_messages(conversation, history)
         model = conversation.model or self._config.default_model
 
-        logger.info("LLM turn: conversation=%s model=%s history=%d", conversation_id, model, len(messages))
-        response = self._client.chat.create(model=model, messages=messages)
+        chat_params: dict = {"model": model, "messages": messages}
+        if conversation.response_schema:
+            chat_params["response_format"] = build_json_schema_response_format(conversation.response_schema)
 
-        reply = response.choices[0].message.content or ""
+        logger.info(
+            "LLM turn: conversation=%s model=%s history=%d structured=%s",
+            conversation_id, model, len(messages), conversation.response_schema is not None,
+        )
+        response = self._client.chat.create(**chat_params)
+
+        reply = self._extract_reply(response.choices[0].message.content, conversation.response_schema)
         token_count = response.usage.completion_tokens if response.usage else None
 
         assistant_message = self._db.create_message(
@@ -66,3 +78,15 @@ class ChatService:
         for message in history:
             messages.append({"role": message.role, "content": message.content})
         return messages
+
+    def _extract_reply(self, content: Any, response_schema: Optional[dict]) -> str:
+        """
+        Reduce the model's reply to the string stored in Message.content.
+
+        For structured-output conversations, validate the reply against the
+        schema (raises on invalid JSON / non-object) and store the JSON string.
+        """
+        if response_schema:
+            parsed = parse_schema_response(content, response_schema)
+            return content if isinstance(content, str) else json.dumps(parsed)
+        return content or ""
