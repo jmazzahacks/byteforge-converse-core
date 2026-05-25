@@ -11,8 +11,10 @@ import logging
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
+import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor, Json
+from psycopg2.extensions import connection as PgConnection
 
 from byteforge_converse_models import (
     Conversation,
@@ -49,17 +51,38 @@ class Database:
 
     @contextmanager
     def _cursor(self, commit: bool = False) -> Iterator[RealDictCursor]:
-        conn = self._pool.getconn()
+        conn = self._get_live_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 yield cursor
             if commit:
                 conn.commit()
+            else:
+                # End the read's implicit transaction so the connection is not
+                # returned to the pool "idle in transaction".
+                conn.rollback()
         except Exception:
             conn.rollback()
             raise
         finally:
             self._pool.putconn(conn)
+
+    def _get_live_connection(self) -> PgConnection:
+        """
+        Check out a pooled connection, transparently replacing one that died
+        while idle (closed by the server, a proxy, or a firewall). Costs one
+        `SELECT 1` per checkout — negligible against LLM-bound request latency.
+        """
+        for _ in range(2):
+            conn = self._pool.getconn()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                conn.rollback()
+                return conn
+            except psycopg2.OperationalError:
+                self._pool.putconn(conn, close=True)
+        raise psycopg2.OperationalError("could not obtain a live database connection")
 
     def close(self) -> None:
         self._pool.closeall()
@@ -137,6 +160,12 @@ class Database:
             )
             rows = cursor.fetchall()
         return [Message.from_dict(dict(row)) for row in rows]
+
+    def delete_message(self, message_id: str) -> bool:
+        with self._cursor(commit=True) as cursor:
+            cursor.execute("DELETE FROM messages WHERE id = %s", (message_id,))
+            deleted = cursor.rowcount
+        return deleted > 0
 
     # --- sessions ----------------------------------------------------------
 

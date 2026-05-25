@@ -45,25 +45,29 @@ class ChatService:
         if conversation is None:
             raise ValueError(f"Conversation not found: {conversation_id}")
 
-        # Persist the user turn first so it is part of the history we send.
-        self._db.create_message(conversation_id, "user", user_content)
+        # Persist the user turn first so its created_at precedes the assistant
+        # reply (LLM latency separates them). If the LLM call fails we delete it
+        # again, so a failed turn leaves no orphaned user message behind.
+        user_message = self._db.create_message(conversation_id, "user", user_content)
+        try:
+            history = self._db.list_messages(conversation_id)
+            messages = self._build_messages(conversation, history)
+            model = conversation.model or self._config.default_model
 
-        history = self._db.list_messages(conversation_id)
-        messages = self._build_messages(conversation, history)
-        model = conversation.model or self._config.default_model
+            chat_params: dict = {"model": model, "messages": messages}
+            if conversation.response_schema:
+                chat_params["response_format"] = build_json_schema_response_format(conversation.response_schema)
 
-        chat_params: dict = {"model": model, "messages": messages}
-        if conversation.response_schema:
-            chat_params["response_format"] = build_json_schema_response_format(conversation.response_schema)
-
-        logger.info(
-            "LLM turn: conversation=%s model=%s history=%d structured=%s",
-            conversation_id, model, len(messages), conversation.response_schema is not None,
-        )
-        response = self._client.chat.create(**chat_params)
-
-        reply = self._extract_reply(response.choices[0].message.content, conversation.response_schema)
-        token_count = response.usage.completion_tokens if response.usage else None
+            logger.info(
+                "LLM turn: conversation=%s model=%s history=%d structured=%s",
+                conversation_id, model, len(messages), conversation.response_schema is not None,
+            )
+            response = self._client.chat.create(**chat_params)
+            reply = self._extract_reply(response.choices[0].message.content, conversation.response_schema)
+            token_count = response.usage.completion_tokens if response.usage else None
+        except Exception:
+            self._db.delete_message(user_message.id)
+            raise
 
         assistant_message = self._db.create_message(
             conversation_id, "assistant", reply, token_count=token_count
