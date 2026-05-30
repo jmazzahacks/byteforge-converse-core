@@ -91,11 +91,12 @@ class Database:
 
     def create_conversation(self, create: ConversationCreate) -> Conversation:
         response_schema = Json(create.response_schema) if create.response_schema is not None else None
+        tools = Json(create.tools) if create.tools is not None else None
         with self._cursor(commit=True) as cursor:
             cursor.execute(
-                "INSERT INTO conversations (user_id, title, model, system_prompt, response_schema) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING *",
-                (create.user_id, create.title, create.model, create.system_prompt, response_schema),
+                "INSERT INTO conversations (user_id, title, model, system_prompt, response_schema, tools) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+                (create.user_id, create.title, create.model, create.system_prompt, response_schema, tools),
             )
             row = cursor.fetchone()
         return Conversation.from_dict(dict(row))
@@ -139,25 +140,47 @@ class Database:
         role: str,
         content: str,
         token_count: Optional[int] = None,
+        tool_calls: Optional[list] = None,
+        tool_call_id: Optional[str] = None,
     ) -> Message:
         if role not in VALID_ROLES:
             raise ValueError(f"role must be one of {sorted(VALID_ROLES)}, got {role!r}")
+        tool_calls_json = Json(tool_calls) if tool_calls is not None else None
         with self._cursor(commit=True) as cursor:
             cursor.execute(
-                "INSERT INTO messages (conversation_id, role, content, token_count) "
-                "VALUES (%s, %s, %s, %s) RETURNING *",
-                (conversation_id, role, content, token_count),
+                "INSERT INTO messages (conversation_id, role, content, token_count, tool_calls, tool_call_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+                (conversation_id, role, content, token_count, tool_calls_json, tool_call_id),
             )
             row = cursor.fetchone()
         return Message.from_dict(dict(row))
 
-    def list_messages(self, conversation_id: str, limit: int = 100, offset: int = 0) -> list[Message]:
+    def list_messages(
+        self,
+        conversation_id: str,
+        limit: Optional[int] = 100,
+        offset: int = 0,
+    ) -> list[Message]:
+        """
+        List messages in created_at ASC order.
+
+        `limit=None` means no LIMIT (return all rows). The default 100 stays in
+        place for paginated read endpoints; chat-turn replay passes `None` so
+        long conversations are never silently truncated mid-history.
+        """
         with self._cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM messages WHERE conversation_id = %s "
-                "ORDER BY created_at ASC LIMIT %s OFFSET %s",
-                (conversation_id, limit, offset),
-            )
+            if limit is None:
+                cursor.execute(
+                    "SELECT * FROM messages WHERE conversation_id = %s "
+                    "ORDER BY created_at ASC OFFSET %s",
+                    (conversation_id, offset),
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM messages WHERE conversation_id = %s "
+                    "ORDER BY created_at ASC LIMIT %s OFFSET %s",
+                    (conversation_id, limit, offset),
+                )
             rows = cursor.fetchall()
         return [Message.from_dict(dict(row)) for row in rows]
 

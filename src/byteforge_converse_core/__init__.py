@@ -7,4 +7,4 @@ from .database import Database
 from .chat import ChatService
 
 __all__ = ["Database", "DatabaseConfig", "LLMConfig", "DEFAULT_LLM_MODEL", "ChatService"]
-__version__ = "0.4.0"
+__version__ = "0.6.0"
