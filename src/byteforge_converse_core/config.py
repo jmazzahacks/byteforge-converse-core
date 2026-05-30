@@ -37,7 +37,7 @@ class DatabaseConfig:
         )
 
 
-DEFAULT_LLM_MODEL = "anthropic/claude-3.5-sonnet"
+DEFAULT_LLM_MODEL = "anthropic/claude-sonnet-4-5"
 
 
 @dataclass
