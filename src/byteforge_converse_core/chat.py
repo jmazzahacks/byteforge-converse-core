@@ -56,6 +56,49 @@ class ChatService:
         # reply (LLM latency separates them). If the LLM call fails we delete
         # it again so a failed turn leaves no orphaned user message behind.
         user_message = self._db.create_message(conversation_id, "user", user_content)
+        return self._drive_turn(conversation, conversation_id, user_message.id)
+
+    def send_tool_result(
+        self,
+        conversation_id: str,
+        tool_call_id: str,
+        content: str,
+    ) -> ChatTurn:
+        """
+        Append a tool result, drive the next LLM turn, return the ChatTurn.
+
+        Sugar over `POST /messages` (role=tool) + `POST /chat`: persists the
+        tool message with the matching `tool_call_id` and immediately drives
+        the model's next reply in one operation. Useful when the caller has
+        just executed a tool the model requested and has no user content to
+        prompt with.
+
+        Raises ValueError if the conversation does not exist.
+        """
+        conversation = self._db.get_conversation(conversation_id)
+        if conversation is None:
+            raise ValueError(f"Conversation not found: {conversation_id}")
+
+        tool_message = self._db.create_message(
+            conversation_id,
+            "tool",
+            content,
+            tool_call_id=tool_call_id,
+        )
+        return self._drive_turn(conversation, conversation_id, tool_message.id)
+
+    def _drive_turn(
+        self,
+        conversation: Conversation,
+        conversation_id: str,
+        compensating_message_id: str,
+    ) -> ChatTurn:
+        """
+        Replay history, call the LLM, persist the assistant reply. Shared by
+        `send_turn` and `send_tool_result` — the only difference between them
+        is which row gets prepended to history (and which to compensate-delete
+        if the LLM call fails).
+        """
         reply = ""
         token_count: Optional[int] = None
         raw_tool_calls: Optional[list] = None
@@ -84,7 +127,7 @@ class ChatService:
             reply = self._extract_reply(response_message.content, conversation.response_schema)
             token_count = response.usage.completion_tokens if response.usage else None
         except Exception:
-            self._db.delete_message(user_message.id)
+            self._db.delete_message(compensating_message_id)
             raise
 
         assistant_message = self._db.create_message(
