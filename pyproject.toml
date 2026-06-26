@@ -1,6 +1,6 @@
 [project]
 name = "byteforge-converse-core"
-version = "0.7.0"
+version = "0.8.0"
 authors = [
   { name="Jason Byteforge", email="jason@reallybadapps.com" },
 ]
