@@ -303,7 +303,17 @@ class Database:
         offset: int = 0,
     ) -> list[Message]:
         """
-        List messages in created_at ASC order.
+        List messages in the order they were written.
+
+        created_at is epoch SECONDS, so messages written within the same
+        second tie on it, and Postgres returns ties in no particular order.
+        A chat turn routinely writes several rows inside one second (a tool
+        call, its result, the next reply; or a fast reply followed by the
+        user's next message), and replaying them out of order breaks the LLM
+        protocol: a history ending on an assistant row is rejected by models
+        that do not support prefill ("the conversation must end with a user
+        message"), and a tool row replayed before its tool call is invalid.
+        seq (BIGSERIAL, insertion order) breaks the tie.
 
         `limit=None` means no LIMIT (return all rows). The default 100 stays in
         place for paginated read endpoints; chat-turn replay passes `None` so
@@ -313,13 +323,13 @@ class Database:
             if limit is None:
                 cursor.execute(
                     "SELECT * FROM messages WHERE conversation_id = %s "
-                    "ORDER BY created_at ASC OFFSET %s",
+                    "ORDER BY created_at ASC, seq ASC OFFSET %s",
                     (conversation_id, offset),
                 )
             else:
                 cursor.execute(
                     "SELECT * FROM messages WHERE conversation_id = %s "
-                    "ORDER BY created_at ASC LIMIT %s OFFSET %s",
+                    "ORDER BY created_at ASC, seq ASC LIMIT %s OFFSET %s",
                     (conversation_id, limit, offset),
                 )
             rows = cursor.fetchall()

@@ -272,3 +272,25 @@ def test_safe_putback_swallows_pool_putconn_failure() -> None:
         pass
 
     alive.close.assert_called_once()
+
+
+# --- history ordering ---------------------------------------------------------
+
+
+def test_list_messages_breaks_same_second_ties_by_insertion_order() -> None:
+    """created_at is epoch seconds; a turn writes several rows in one second.
+    Without a tiebreaker Postgres may replay an assistant row last (rejected
+    by no-prefill models) or a tool result before its tool call."""
+    conn = _alive_conn()
+    db = _make_db_with_mocked_pool([conn])
+    cursor = conn.cursor.return_value
+    cursor.fetchall.return_value = []
+
+    db.list_messages("conv-1", limit=None)
+    db._pool.getconn.side_effect = [conn]
+    db.list_messages("conv-1", limit=50)
+
+    queries = [call.args[0] for call in cursor.execute.call_args_list if "FROM messages" in call.args[0]]
+    assert len(queries) == 2
+    for query in queries:
+        assert "ORDER BY created_at ASC, seq ASC" in query
