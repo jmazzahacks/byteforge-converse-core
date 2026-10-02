@@ -1,7 +1,7 @@
 """
 Postgres persistence layer for ByteforgeConverse.
 
-Owns the only database connection in the product. Reads use `RealDictCursor`
+Provides pooled convenience operations and caller-owned transaction repositories. Reads use `RealDictCursor`
 so rows reconstruct directly into models via `Model.from_dict(dict(row))`.
 All date/time columns are `BIGINT` unix timestamps; the database generates
 ids (`gen_random_uuid()`) and `created_at` defaults, returned via `RETURNING *`.
@@ -11,6 +11,7 @@ import logging
 import random
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Iterator, Optional
 
 import psycopg2
@@ -46,7 +47,333 @@ _RETRY_BACKOFF_MAX_SEC = 0.5
 _CHECKOUT_WARN_INTERVAL_SEC = 5.0
 
 
-class Database:
+class ResourceNotFound(LookupError):
+    """Resource is absent or outside the supplied ownership scope."""
+
+
+class IdempotencyConflict(ValueError):
+    """A delivery key already identifies a different persisted payload."""
+
+
+class ConcurrentMessageChange(RuntimeError):
+    """A conflicting message disappeared; caller may retry its whole transaction."""
+
+
+@dataclass(frozen=True)
+class AppendResult:
+    """Storage metadata; seq is an ordering tiebreaker, NOT a commit watermark."""
+
+    message: Message
+    created: bool
+    seq: int
+    producer: str
+    delivery_key: str
+
+
+class Repository:
+    """Conversation/message operations on a caller-owned psycopg2 connection.
+
+    The caller owns commit, rollback, close and pool return. Construct one per
+    transaction; never share a connection/repository between concurrent tasks.
+    No pre-ping or automatic retry is performed on a borrowed transaction.
+    """
+
+    _owner_id: Optional[str] = None
+
+    def for_owner(self, owner_id: str) -> "OwnerRepository":
+        """Scope operations to an already authenticated opaque owner ID."""
+        if self._owner_id is not None and owner_id != self._owner_id:
+            raise ValueError("Cannot change an existing repository's owner scope")
+        return OwnerRepository(self, owner_id)
+
+    def _require_conversation(
+        self, cursor: RealDictCursor, conversation_id: str
+    ) -> None:
+        # Hold ownership stable until transaction completion, including the
+        # duplicate lookup. FOR SHARE also prevents concurrent owner changes.
+        cursor.execute(
+            "SELECT id FROM conversations WHERE id = %s "
+            "AND (%s::text IS NULL OR user_id = %s) FOR SHARE",
+            (conversation_id, self._owner_id, self._owner_id),
+        )
+        if cursor.fetchone() is None:
+            raise ResourceNotFound("Conversation not found")
+
+    def __init__(self, connection: PgConnection) -> None:
+        if connection.autocommit:
+            raise ValueError("Repository requires a non-autocommit connection")
+        self._borrowed_connection = connection
+        self._active = True
+
+    @contextmanager
+    def _cursor(self, commit: bool = False) -> Iterator[RealDictCursor]:
+        if not self._active:
+            raise RuntimeError("Transaction repository is no longer active")
+        if self._borrowed_connection.autocommit:
+            raise ValueError("Repository requires a non-autocommit connection")
+        cursor = self._borrowed_connection.cursor(cursor_factory=RealDictCursor)
+        try:
+            yield cursor
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    # --- conversations -----------------------------------------------------
+
+    def create_conversation(self, create: ConversationCreate) -> Conversation:
+        if self._owner_id is not None and create.user_id != self._owner_id:
+            raise ValueError("Conversation owner does not match repository scope")
+        response_schema = (
+            Json(create.response_schema) if create.response_schema is not None else None
+        )
+        tools = Json(create.tools) if create.tools is not None else None
+        with self._cursor(commit=True) as cursor:
+            cursor.execute(
+                "INSERT INTO conversations (user_id, title, model, system_prompt, response_schema, tools) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+                (
+                    create.user_id,
+                    create.title,
+                    create.model,
+                    create.system_prompt,
+                    response_schema,
+                    tools,
+                ),
+            )
+            row = cursor.fetchone()
+        return Conversation.from_dict(dict(row))
+
+    def touch_conversation(self, conversation_id: str, updated_at: int) -> None:
+        with self._cursor(commit=True) as cursor:
+            cursor.execute(
+                "UPDATE conversations SET updated_at = %s WHERE id = %s "
+                "AND (%s::text IS NULL OR user_id = %s)",
+                (updated_at, conversation_id, self._owner_id, self._owner_id),
+            )
+
+    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM conversations WHERE id = %s AND (%s::text IS NULL OR user_id = %s)",
+                (conversation_id, self._owner_id, self._owner_id),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return Conversation.from_dict(dict(row))
+
+    def list_conversations(
+        self, user_id: Optional[str] = None, limit: int = 100, offset: int = 0
+    ) -> list[Conversation]:
+        if self._owner_id is not None:
+            if user_id is not None and user_id != self._owner_id:
+                raise ValueError("Requested owner does not match repository scope")
+            user_id = self._owner_id
+        elif user_id is None:
+            raise ValueError("user_id is required for an unscoped repository")
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM conversations WHERE user_id = %s "
+                "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                (user_id, limit, offset),
+            )
+            rows = cursor.fetchall()
+        return [Conversation.from_dict(dict(row)) for row in rows]
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        with self._cursor(commit=True) as cursor:
+            cursor.execute(
+                "DELETE FROM conversations WHERE id = %s AND (%s::text IS NULL OR user_id = %s)",
+                (conversation_id, self._owner_id, self._owner_id),
+            )
+            deleted = cursor.rowcount
+        return deleted > 0
+
+    # --- messages ----------------------------------------------------------
+
+    def create_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        token_count: Optional[int] = None,
+        tool_calls: Optional[list] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> Message:
+        if role not in VALID_ROLES:
+            raise ValueError(f"role must be one of {sorted(VALID_ROLES)}, got {role!r}")
+        tool_calls_json = Json(tool_calls) if tool_calls is not None else None
+        with self._cursor(commit=True) as cursor:
+            if self._owner_id is not None:
+                self._require_conversation(cursor, conversation_id)
+            cursor.execute(
+                "INSERT INTO messages (conversation_id, role, content, token_count, tool_calls, tool_call_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+                (
+                    conversation_id,
+                    role,
+                    content,
+                    token_count,
+                    tool_calls_json,
+                    tool_call_id,
+                ),
+            )
+            row = cursor.fetchone()
+        return Message.from_dict(dict(row))
+
+    def append_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        *,
+        producer: str,
+        delivery_key: str,
+        token_count: Optional[int] = None,
+        tool_calls: Optional[list] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> AppendResult:
+        """Idempotently append; key namespace is (conversation, producer, key).
+
+        Every persisted payload field participates in conflict detection,
+        including token_count. No existing payload is ever overwritten.
+        REPEATABLE READ/SERIALIZABLE conflicts propagate to the transaction
+        owner; the repository never retries a borrowed transaction.
+        """
+        if role not in VALID_ROLES:
+            raise ValueError(f"role must be one of {sorted(VALID_ROLES)}, got {role!r}")
+        for name, value, maximum in (
+            ("producer", producer, 128),
+            ("delivery_key", delivery_key, 512),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value.encode("utf-8")) > maximum
+            ):
+                raise ValueError(
+                    f"{name} must be nonblank and at most {maximum} UTF-8 bytes"
+                )
+        payload = (
+            role,
+            content,
+            token_count,
+            Json(tool_calls) if tool_calls is not None else None,
+            tool_call_id,
+        )
+        with self._cursor(commit=True) as cursor:
+            self._require_conversation(cursor, conversation_id)
+            cursor.execute(
+                "INSERT INTO messages (conversation_id, role, content, token_count, tool_calls, tool_call_id, producer, delivery_key) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (conversation_id, producer, delivery_key) WHERE delivery_key IS NOT NULL "
+                "DO NOTHING RETURNING *",
+                (conversation_id, *payload, producer, delivery_key),
+            )
+            row = cursor.fetchone()
+            created = row is not None
+            if row is None:
+                # A separate statement gets a fresh READ COMMITTED snapshot
+                # after ON CONFLICT waits for a concurrent writer to commit.
+                cursor.execute(
+                    "SELECT *, (role = %s AND content = %s "
+                    "AND token_count IS NOT DISTINCT FROM %s "
+                    "AND tool_calls IS NOT DISTINCT FROM %s::jsonb "
+                    "AND tool_call_id IS NOT DISTINCT FROM %s) AS same_payload "
+                    "FROM messages WHERE conversation_id = %s AND producer = %s AND delivery_key = %s FOR SHARE",
+                    (*payload, conversation_id, producer, delivery_key),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ConcurrentMessageChange(
+                        "Message changed during retry lookup; retry the transaction"
+                    )
+                if not row["same_payload"]:
+                    raise IdempotencyConflict(
+                        "Delivery key already identifies a different message payload"
+                    )
+            return AppendResult(
+                Message.from_dict(dict(row)),
+                created,
+                int(row["seq"]),
+                producer,
+                delivery_key,
+            )
+
+    def list_messages(
+        self,
+        conversation_id: str,
+        limit: Optional[int] = 100,
+        offset: int = 0,
+    ) -> list[Message]:
+        """
+        List messages in the order they were written.
+
+        created_at is epoch SECONDS, so messages written within the same
+        second tie on it, and Postgres returns ties in no particular order.
+        A chat turn routinely writes several rows inside one second (a tool
+        call, its result, the next reply; or a fast reply followed by the
+        user's next message), and replaying them out of order breaks the LLM
+        protocol: a history ending on an assistant row is rejected by models
+        that do not support prefill ("the conversation must end with a user
+        message"), and a tool row replayed before its tool call is invalid.
+        seq (BIGSERIAL, insertion order) breaks the tie.
+
+        `limit=None` means no LIMIT (return all rows). The default 100 stays in
+        place for paginated read endpoints; chat-turn replay passes `None` so
+        long conversations are never silently truncated mid-history.
+        """
+        owner_filter = ""
+        params: tuple = (conversation_id,)
+        if self._owner_id is not None:
+            owner_filter = "AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = messages.conversation_id AND c.user_id = %s) "
+            params += (self._owner_id,)
+        query = (
+            "SELECT * FROM messages WHERE conversation_id = %s "
+            + owner_filter
+            + "ORDER BY created_at ASC, seq ASC "
+        )
+        if limit is not None:
+            query += "LIMIT %s "
+            params += (limit,)
+        query += "OFFSET %s"
+        params += (offset,)
+        with self._cursor() as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        return [Message.from_dict(dict(row)) for row in rows]
+
+    def delete_message(self, message_id: str) -> bool:
+        with self._cursor(commit=True) as cursor:
+            cursor.execute(
+                "DELETE FROM messages m USING conversations c WHERE m.id = %s "
+                "AND c.id = m.conversation_id AND (%s::text IS NULL OR c.user_id = %s)",
+                (message_id, self._owner_id, self._owner_id),
+            )
+            deleted = cursor.rowcount
+        return deleted > 0
+
+
+class OwnerRepository(Repository):
+    """Explicit owner facade; authentication and identity resolution stay upstream."""
+
+    def __init__(self, repository: Repository, owner_id: str) -> None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must be a nonblank authenticated identity")
+        if repository._owner_id is not None and repository._owner_id != owner_id:
+            raise ValueError("Cannot change an existing repository's owner scope")
+        self._repository = repository
+        self._owner_id = owner_id
+
+    @contextmanager
+    def _cursor(self, commit: bool = False) -> Iterator[RealDictCursor]:
+        with self._repository._cursor(commit=commit) as cursor:
+            yield cursor
+
+
+class Database(Repository):
     """Connection-pooled Postgres access for conversations, messages, and sessions.
 
     Pre-pings every pooled checkout and recovers transparently from upstream
@@ -54,7 +381,9 @@ class Database:
     never at import time.
     """
 
-    def __init__(self, config: DatabaseConfig, min_conn: int = 1, max_conn: int = 10) -> None:
+    def __init__(
+        self, config: DatabaseConfig, min_conn: int = 1, max_conn: int = 10
+    ) -> None:
         self._pool = ThreadedConnectionPool(
             min_conn,
             max_conn,
@@ -79,12 +408,17 @@ class Database:
         # Monotonic clock of the last WARNING-level checkout failure; used
         # to throttle the warning log during a Postgres bounce.
         self._last_checkout_warn: float = 0.0
-        logger.info("Database connection pool initialized (%s:%s/%s)", config.host, config.port, config.name)
+        logger.info(
+            "Database connection pool initialized (%s:%s/%s)",
+            config.host,
+            config.port,
+            config.name,
+        )
 
     @staticmethod
     def _check_alive(conn: PgConnection) -> None:
         """Pre-ping `conn` with `SELECT 1`. Raises on dead conn."""
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
         try:
             cur.execute("SELECT 1")
             cur.fetchone()
@@ -118,13 +452,15 @@ class Database:
             log = logger.debug
         log(
             "DB checkout pre-ping failed (attempt %d/%d): %s",
-            attempt + 1, MAX_HEALTH_RETRIES, exc,
+            attempt + 1,
+            MAX_HEALTH_RETRIES,
+            exc,
         )
 
     @staticmethod
     def _retry_backoff(attempt: int) -> float:
         """Full-jitter exponential backoff in seconds."""
-        base = min(_RETRY_BACKOFF_BASE_SEC * (2 ** attempt), _RETRY_BACKOFF_MAX_SEC)
+        base = min(_RETRY_BACKOFF_BASE_SEC * (2**attempt), _RETRY_BACKOFF_MAX_SEC)
         return random.uniform(0, base)
 
     def _acquire_live_conn(self) -> PgConnection:
@@ -225,121 +561,23 @@ class Database:
                 except Exception:
                     pass
 
+    @contextmanager
+    def transaction(self) -> Iterator[Repository]:
+        """Commit a complete unit of storage work, or roll it back on error.
+
+        Checkout recovery happens before the transaction starts. The body and
+        commit are never replayed; an ambiguous commit error propagates.
+        """
+        with self._connection() as connection:
+            repository = Repository(connection)
+            try:
+                yield repository
+                connection.commit()
+            finally:
+                repository._active = False
+
     def close(self) -> None:
         self._pool.closeall()
-
-    # --- conversations -----------------------------------------------------
-
-    def create_conversation(self, create: ConversationCreate) -> Conversation:
-        response_schema = Json(create.response_schema) if create.response_schema is not None else None
-        tools = Json(create.tools) if create.tools is not None else None
-        with self._cursor(commit=True) as cursor:
-            cursor.execute(
-                "INSERT INTO conversations (user_id, title, model, system_prompt, response_schema, tools) "
-                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
-                (create.user_id, create.title, create.model, create.system_prompt, response_schema, tools),
-            )
-            row = cursor.fetchone()
-        return Conversation.from_dict(dict(row))
-
-    def touch_conversation(self, conversation_id: str, updated_at: int) -> None:
-        with self._cursor(commit=True) as cursor:
-            cursor.execute(
-                "UPDATE conversations SET updated_at = %s WHERE id = %s",
-                (updated_at, conversation_id),
-            )
-
-    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        with self._cursor() as cursor:
-            cursor.execute("SELECT * FROM conversations WHERE id = %s", (conversation_id,))
-            row = cursor.fetchone()
-        if row is None:
-            return None
-        return Conversation.from_dict(dict(row))
-
-    def list_conversations(self, user_id: str, limit: int = 100, offset: int = 0) -> list[Conversation]:
-        with self._cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM conversations WHERE user_id = %s "
-                "ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                (user_id, limit, offset),
-            )
-            rows = cursor.fetchall()
-        return [Conversation.from_dict(dict(row)) for row in rows]
-
-    def delete_conversation(self, conversation_id: str) -> bool:
-        with self._cursor(commit=True) as cursor:
-            cursor.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
-            deleted = cursor.rowcount
-        return deleted > 0
-
-    # --- messages ----------------------------------------------------------
-
-    def create_message(
-        self,
-        conversation_id: str,
-        role: str,
-        content: str,
-        token_count: Optional[int] = None,
-        tool_calls: Optional[list] = None,
-        tool_call_id: Optional[str] = None,
-    ) -> Message:
-        if role not in VALID_ROLES:
-            raise ValueError(f"role must be one of {sorted(VALID_ROLES)}, got {role!r}")
-        tool_calls_json = Json(tool_calls) if tool_calls is not None else None
-        with self._cursor(commit=True) as cursor:
-            cursor.execute(
-                "INSERT INTO messages (conversation_id, role, content, token_count, tool_calls, tool_call_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
-                (conversation_id, role, content, token_count, tool_calls_json, tool_call_id),
-            )
-            row = cursor.fetchone()
-        return Message.from_dict(dict(row))
-
-    def list_messages(
-        self,
-        conversation_id: str,
-        limit: Optional[int] = 100,
-        offset: int = 0,
-    ) -> list[Message]:
-        """
-        List messages in the order they were written.
-
-        created_at is epoch SECONDS, so messages written within the same
-        second tie on it, and Postgres returns ties in no particular order.
-        A chat turn routinely writes several rows inside one second (a tool
-        call, its result, the next reply; or a fast reply followed by the
-        user's next message), and replaying them out of order breaks the LLM
-        protocol: a history ending on an assistant row is rejected by models
-        that do not support prefill ("the conversation must end with a user
-        message"), and a tool row replayed before its tool call is invalid.
-        seq (BIGSERIAL, insertion order) breaks the tie.
-
-        `limit=None` means no LIMIT (return all rows). The default 100 stays in
-        place for paginated read endpoints; chat-turn replay passes `None` so
-        long conversations are never silently truncated mid-history.
-        """
-        with self._cursor() as cursor:
-            if limit is None:
-                cursor.execute(
-                    "SELECT * FROM messages WHERE conversation_id = %s "
-                    "ORDER BY created_at ASC, seq ASC OFFSET %s",
-                    (conversation_id, offset),
-                )
-            else:
-                cursor.execute(
-                    "SELECT * FROM messages WHERE conversation_id = %s "
-                    "ORDER BY created_at ASC, seq ASC LIMIT %s OFFSET %s",
-                    (conversation_id, limit, offset),
-                )
-            rows = cursor.fetchall()
-        return [Message.from_dict(dict(row)) for row in rows]
-
-    def delete_message(self, message_id: str) -> bool:
-        with self._cursor(commit=True) as cursor:
-            cursor.execute("DELETE FROM messages WHERE id = %s", (message_id,))
-            deleted = cursor.rowcount
-        return deleted > 0
 
     # --- sessions ----------------------------------------------------------
 
