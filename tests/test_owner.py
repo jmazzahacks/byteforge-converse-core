@@ -85,5 +85,50 @@ def test_owner_query_contains_predicate_and_append_locks_scope() -> None:
         query, params = call.args
         assert "user_id = %s" in query
         assert "authenticated-owner" in params
-    assert "FOR SHARE" in cur.execute.call_args.args[0]
+    assert "FOR NO KEY UPDATE" in cur.execute.call_args.args[0]
     assert not any("INSERT" in call.args[0] for call in cur.execute.call_args_list)
+
+
+def test_delete_rechecks_owner_after_concurrent_transfer(
+    connection: PgConnection, pg_schema: tuple[str, str]
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from psycopg2.extras import RealDictCursor
+    from conftest import connect_test, wait_for_lock_or_completion
+
+    repo = Repository(connection)
+    conversation = repo.create_conversation(
+        ConversationCreate(user_id="a", title="transferred")
+    )
+    message = repo.create_message(conversation.id, "user", "keep")
+    connection.commit()
+    transfer, deletion = connect_test(pg_schema), connect_test(pg_schema)
+    try:
+        with transfer.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                "UPDATE conversations SET user_id='b' WHERE id=%s", (conversation.id,)
+            )
+
+        def delete_as_old_owner() -> bool:
+            with deletion:
+                return Repository(deletion).for_owner("a").delete_message(message.id)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(delete_as_old_owner)
+            try:
+                wait_for_lock_or_completion(
+                    connection,
+                    deletion.get_backend_pid(),
+                    transfer.get_backend_pid(),
+                    future,
+                )
+                transfer.commit()
+                assert future.result(timeout=5) is False
+            finally:
+                transfer.rollback()
+        assert [m.id for m in repo.for_owner("b").list_messages(conversation.id)] == [
+            message.id
+        ]
+    finally:
+        transfer.close()
+        deletion.close()

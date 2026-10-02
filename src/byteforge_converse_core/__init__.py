@@ -15,7 +15,7 @@ __all__ = [
     "DEFAULT_LLM_MODEL",
     "ChatService",
 ]
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 
 def __getattr__(name: str) -> Any:

@@ -160,3 +160,63 @@ def test_managed_commit_failure_is_not_replayed() -> None:
     assert conn.commit.call_count == 1
     assert db._pool.getconn.call_count == 1
     db._pool.putconn.assert_called_once()
+
+
+def test_managed_transaction_reports_caught_database_failure(
+    database: Database,
+) -> None:
+    import psycopg2
+    import uuid
+
+    with pytest.raises(psycopg2.errors.InFailedSqlTransaction):
+        with database.transaction() as repo:
+            conversation = repo.create_conversation(
+                ConversationCreate(user_id="a", title="must roll back")
+            )
+            try:
+                repo.create_message(str(uuid.uuid4()), "user", "invalid FK")
+            except psycopg2.IntegrityError:
+                pass  # Catching the statement error does not repair the transaction.
+    assert database.get_conversation(conversation.id) is None
+
+
+def test_concurrent_append_then_touch_does_not_upgrade_shared_locks(
+    connection: PgConnection, pg_schema: tuple[str, str]
+) -> None:
+    from conftest import wait_for_lock_or_completion
+
+    cid = (
+        Repository(connection)
+        .create_conversation(ConversationCreate(user_id="a", title="concurrent"))
+        .id
+    )
+    connection.commit()
+    first, second = connect_test(pg_schema), connect_test(pg_schema)
+    first_repo = Repository(first).for_owner("a")
+    first_repo.append_message(cid, "user", "first", producer="p", delivery_key="1")
+
+    def second_writer() -> None:
+        with second:
+            repo = Repository(second).for_owner("a")
+            repo.append_message(cid, "user", "second", producer="p", delivery_key="2")
+            repo.touch_conversation(cid, 101)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(second_writer)
+            try:
+                wait_for_lock_or_completion(
+                    connection,
+                    second.get_backend_pid(),
+                    first.get_backend_pid(),
+                    future,
+                )
+                first_repo.touch_conversation(cid, 100)
+                first.commit()
+                future.result(timeout=5)
+            finally:
+                first.rollback()
+        assert len(Repository(connection).list_messages(cid)) == 2
+    finally:
+        first.close()
+        second.close()

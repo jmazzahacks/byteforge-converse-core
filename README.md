@@ -1,9 +1,13 @@
 # byteforge-converse-core
 
 Postgres conversation storage and optional OpenRouter chat orchestration. Version
-0.9.0 adds embedded storage without changing existing HTTP/wire models or chat
+0.9.1 provides embedded storage without changing existing HTTP/wire models or chat
 imports. Authentication, consumer run/event tables and provider-native transcripts
 remain the consuming application's responsibility.
+
+Version 0.9.1 fixes aborted managed transactions, concurrent append/touch lock
+upgrades and deletion during ownership transfer. Upgrading from 0.9.0 requires
+no additional schema migration.
 
 ## Install and import
 
@@ -64,7 +68,7 @@ python -m byteforge_converse_core.schema > /tmp/converse-schema.sql
 psql -v ON_ERROR_STOP=1 -f /tmp/converse-schema.sql
 ```
 
-Release order: install core >=0.9.0, apply its schema once, then enable new storage
+Release order: install core >=0.9.1, apply its schema once, then enable new storage
 operations or update the backend setup script. The backend's
 `dev_scripts/setup_database.py` calls this packaged API directly; its old
 `database/schema.sql` now fails with migration guidance rather than maintaining
@@ -98,7 +102,10 @@ Ordinary `Database` calls commit writes independently and end read transactions.
 `Database.transaction()` checks out/pre-pings once, commits on successful exit,
 rolls back on failure, and returns/discards the connection through the existing
 recovery path. Its repository and derived owner facades expire on context exit.
-Neither its body nor an ambiguous commit is automatically replayed.
+Neither its body nor an ambiguous commit is automatically replayed. If the body
+catches a SQL error but leaves PostgreSQL's transaction aborted, context exit raises
+`psycopg2.errors.InFailedSqlTransaction` instead of silently reporting success for
+rolled-back writes.
 
 ## Borrow a consumer-owned transaction
 
@@ -206,11 +213,15 @@ rejected; a scoped facade cannot be re-scoped to a different owner. The consumer
 must authenticate that identity first. A user-supplied header, body or query value
 alone is not authentication. No passwords, tokens, Aegis or OAuth checks are added.
 
-Owner predicates are evaluated in SQL. Appends hold a conversation `FOR SHARE`
-lock through insertion/retry lookup so ownership cannot change between the check
-and write. Keep transactions short; transactions that also upgrade those locks
-(e.g. touch/delete the same conversation) may deadlock with concurrent writers,
-so callers should handle PostgreSQL deadlock errors at the transaction boundary.
+Owner predicates are evaluated in SQL. Scoped message writes lock the parent
+conversation with `FOR NO KEY UPDATE` through insertion, retry lookup or deletion.
+This keeps ownership stable, rechecks a concurrent transfer before deletion, and
+serializes writers to the same conversation before they can deadlock upgrading
+shared locks in an append-then-touch transaction. Legacy unscoped insert FK checks
+remain compatible with this lock; it does not turn seq into commit order.
+Keep transactions short. Operations spanning multiple conversations should acquire
+them in a consistent order; arbitrary consumer SQL can still cause deadlocks, which
+callers must handle at the transaction boundary.
 
 Absent and cross-owner resources have the same behavior: conversation get returns
 None, message list returns [], delete returns False, touch is a no-op, and message

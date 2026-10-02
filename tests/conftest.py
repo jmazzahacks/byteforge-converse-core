@@ -3,6 +3,7 @@
 import os
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import Future
 
 import psycopg2
 import pytest
@@ -77,3 +78,24 @@ def database(
         yield db
     finally:
         db.close()
+
+
+def wait_for_lock_or_completion(
+    observer: PgConnection, waiter_pid: int, blocker_pid: int, future: Future
+) -> None:
+    """Synchronize race tests on a real lock wait, not a guessed sleep duration."""
+    import time
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if future.done():
+            return
+        with observer.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                "SELECT %s = ANY(pg_blocking_pids(%s)) AS blocked",
+                (blocker_pid, waiter_pid),
+            )
+            if cursor.fetchone()["blocked"]:
+                return
+        time.sleep(0.01)
+    raise AssertionError("Worker neither completed nor waited for the expected lock")

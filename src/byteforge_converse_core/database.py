@@ -17,7 +17,7 @@ from typing import Iterator, Optional
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor, Json
-from psycopg2.extensions import connection as PgConnection
+from psycopg2.extensions import connection as PgConnection, TRANSACTION_STATUS_INERROR
 
 from byteforge_converse_models import (
     Conversation,
@@ -89,11 +89,13 @@ class Repository:
     def _require_conversation(
         self, cursor: RealDictCursor, conversation_id: str
     ) -> None:
-        # Hold ownership stable until transaction completion, including the
-        # duplicate lookup. FOR SHARE also prevents concurrent owner changes.
+        # Acquire the writer lock up front: two FOR SHARE holders that both
+        # touch/delete the conversation later would deadlock on lock upgrade.
+        # NO KEY UPDATE also holds ownership stable, while allowing FK checks
+        # from legacy unscoped inserts (which acquire KEY SHARE).
         cursor.execute(
             "SELECT id FROM conversations WHERE id = %s "
-            "AND (%s::text IS NULL OR user_id = %s) FOR SHARE",
+            "AND (%s::text IS NULL OR user_id = %s) FOR NO KEY UPDATE",
             (conversation_id, self._owner_id, self._owner_id),
         )
         if cursor.fetchone() is None:
@@ -347,6 +349,19 @@ class Repository:
 
     def delete_message(self, message_id: str) -> bool:
         with self._cursor(commit=True) as cursor:
+            if self._owner_id is not None:
+                # DELETE ... USING locks only the message, so its join can
+                # otherwise authorize against a stale conversation owner.
+                # Lock the parent first, just as scoped appends do, and let
+                # Postgres recheck the owner if a concurrent transfer wins.
+                cursor.execute(
+                    "SELECT c.id FROM conversations c JOIN messages m "
+                    "ON m.conversation_id = c.id WHERE m.id = %s "
+                    "AND c.user_id = %s FOR NO KEY UPDATE OF c",
+                    (message_id, self._owner_id),
+                )
+                if cursor.fetchone() is None:
+                    return False
             cursor.execute(
                 "DELETE FROM messages m USING conversations c WHERE m.id = %s "
                 "AND c.id = m.conversation_id AND (%s::text IS NULL OR c.user_id = %s)",
@@ -572,6 +587,13 @@ class Database(Repository):
             repository = Repository(connection)
             try:
                 yield repository
+                # PostgreSQL accepts COMMIT on an aborted transaction as a
+                # ROLLBACK. Do not report success if the body caught a SQL
+                # error without recovering to a savepoint.
+                if connection.get_transaction_status() == TRANSACTION_STATUS_INERROR:
+                    raise psycopg2.errors.InFailedSqlTransaction(
+                        "Cannot commit an aborted transaction; its writes were not saved"
+                    )
                 connection.commit()
             finally:
                 repository._active = False
